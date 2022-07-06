@@ -1,5 +1,5 @@
 #![doc(html_root_url = "https://docs.rs/uhppote-rs/1/")]
-//! uhpote-rs is a safe Rust library for access control systems based on the UHPPOTE UT0311-L0x
+//! uhppote-rs is a safe Rust library for access control systems based on the UHPPOTE UT0311-L0x
 //! TCP/IP Wiegand access control boards. This library is based on
 //! [uhppoted-dll](https://github.com/uhppoted/uhppoted-dll) that's part of the
 //! [uhppoted](https://github.com/uhppoted/uhppoted) project.

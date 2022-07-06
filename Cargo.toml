@@ -1,5 +1,10 @@
 [package]
 name = "uhppote-rs"
+authors = ["Wouter de Bie <wouter@evenflow.nl>"]
+repository = "https://github.com/wouterdebie/uhppote-rs"
+description = "FFI bindings to uhppoted-dll"
+readme = "README.md"
+license = "MIT"
 version = "0.0.1"
 edition = "2021"
 
