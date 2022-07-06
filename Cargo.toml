@@ -1,0 +1,12 @@
+[package]
+name = "uhppote-rs"
+version = "0.0.1"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = "1.0.58"
+c_vec = "2.0.0"
+chrono = "0.4.19"
+uhppote-sys = {path = "../uhppote-sys"}
