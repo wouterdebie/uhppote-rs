@@ -2,10 +2,10 @@
 name = "uhppote-rs"
 authors = ["Wouter de Bie <wouter@evenflow.nl>"]
 repository = "https://github.com/wouterdebie/uhppote-rs"
-description = "FFI bindings to uhppoted-dll"
+description = "Rust bindings for the UHPPOTE library"
 readme = "README.md"
 license = "MIT"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -14,4 +14,4 @@ edition = "2021"
 anyhow = "1.0.58"
 c_vec = "2.0.0"
 chrono = "0.4.19"
-uhppote-sys = "0.0.1"
+uhppote-sys = "0.0.2"
