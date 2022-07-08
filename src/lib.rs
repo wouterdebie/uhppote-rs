@@ -632,7 +632,7 @@ impl<'a> Device<'a> {
     }
 }
 
-unsafe fn get_string(ptr: *mut i8) -> Result<String> {
+unsafe fn get_string(ptr: *mut ::std::os::raw::c_char) -> Result<String> {
     Ok(CStr::from_ptr(ptr).to_str()?.to_string())
 }
 
