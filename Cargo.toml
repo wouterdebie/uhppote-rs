@@ -12,6 +12,6 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0.58"
-c_vec = "2.0.0"
 chrono = "0.4.19"
-uhppote-sys = "0.0.3"
+request_derive = { path = "request_derive" }
+bincode = {version =  "2.0.0-rc.1", features=["derive", "serde"]}

@@ -1,38 +1,40 @@
 #![doc(html_root_url = "https://docs.rs/uhppote-rs/1/")]
 //! uhppote-rs is a safe Rust library for access control systems based on the UHPPOTE UT0311-L0x
-//! TCP/IP Wiegand access control boards. This library is based on
-//! [uhppoted-dll](https://github.com/uhppoted/uhppoted-dll) that's part of the
+//! TCP/IP Wiegand access control boards. This library is based on the
 //! [uhppoted](https://github.com/uhppoted/uhppoted) project.
-//!
-//! This library depends on the [uhppote-sys](https://docs.rs/uhppote-sys/1/) crate, which provides
-//! FFI bindings to the `uhppoted-dll` library.
 //!
 //! Most interactions with the system happen through the [`Device`] type.
 //!
 //! Example:
 //! ```no_run
 //! use uhppote_rs::Uhppote;
-//! let mut uhppoted = Uhppoted::default();
-//! let mut device = uhppoted.get_device(423196779).unwrap();
+//! let uhppoted = Uhppoted::default();
+//! let device = uhppoted.get_device(423196779).unwrap();
 //! let status = device.get_status().unwrap();
 //! ```
-
+mod messages;
+mod types;
 use anyhow::bail;
 use anyhow::Result;
-use c_vec::CVec;
+use chrono::Datelike;
 pub use chrono::NaiveDate;
 pub use chrono::NaiveDateTime;
 pub use chrono::NaiveTime;
-use std::ffi::CStr;
-use std::mem::MaybeUninit;
+use messages::types::DateBCD;
+use messages::*;
+use std::fmt::Debug;
 use std::net::Ipv4Addr;
 use std::net::SocketAddr;
-use std::os::raw::c_char;
-use std::ptr::addr_of_mut;
-use std::{ffi::CString, vec};
+use std::net::UdpSocket;
+use std::time::Duration;
+pub use types::*;
 
+const UHPPOTE_PORT: u16 = 60000;
+#[derive(Debug)]
 pub struct Uhppoted {
-    u: uhppote_sys::UHPPOTE,
+    bind_address: SocketAddr,
+    broadcast_address: Ipv4Addr,
+    timeout: Duration,
 }
 
 impl Uhppoted {
@@ -41,890 +43,484 @@ impl Uhppoted {
     /// Example:
     /// ```no_run
     /// use uhppote_rs::Uhppoted;
-    /// let mut uhppoted = UUhppoted::new(
+    /// let uhppoted = UUhppoted::new(
     ///     "0.0.0.0:0".parse().unwrap(),
-    ///     "255.255.255.255:60000".parse().unwrap(),
-    ///     None,
-    ///     5000,
+    ///     "255.255.255.255".parse().unwrap(),
+    ///     Duration::new(5, 0),
     ///     Vec::new(),
     ///     false,
     /// )
-    /// .unwrap()
-    pub fn new(
-        bind: SocketAddr,
-        broadcast: SocketAddr,
-        listen: Option<SocketAddr>,
-        timeout: i32,
-        controllers: Vec<Controller>,
-        debug: bool,
-    ) -> Result<Uhppoted> {
-        let devices: Result<Vec<uhppote_sys::udevice>> = controllers
-            .iter()
-            .map(|c| {
-                Ok(uhppote_sys::udevice {
-                    id: c.id,
-                    address: CString::new(c.address.to_string())?.into_raw(),
-                })
-            })
-            .collect();
-
-        let udevices = uhppote_sys::udevices {
-            N: controllers.len() as u32,
-            devices: devices?.as_mut_ptr(),
-        };
-
-        let l = match listen {
-            Some(l) => l.to_string(),
-            None => "".to_string(),
-        };
-
-        let u = uhppote_sys::UHPPOTE {
-            bind: CString::new(bind.to_string())?.into_raw(),
-            broadcast: CString::new(broadcast.to_string())?.into_raw(),
-            listen: CString::new(l)?.into_raw(),
+    pub fn new(bind: SocketAddr, broadcast: Ipv4Addr, timeout: Duration) -> Uhppoted {
+        Uhppoted {
+            bind_address: bind,
+            broadcast_address: broadcast,
             timeout,
-            debug,
-            devices: Box::into_raw(Box::new(udevices)),
-        };
-
-        Ok(Uhppoted { u })
+        }
     }
 
-    /// Get all device on the network. This uses the broadcast address to find devices and returns a list
-    /// of identifiers.
-    pub fn get_devices(&mut self) -> Result<Vec<u32>> {
-        let mut allocated = 0;
+    /// Get all the available [`DeviceConfig`]s on the local network. This broadcasts a discovery message
+    /// and waits [`Uhppoted::timeout`] for responses.
+    pub fn get_device_configs(&self) -> Result<Vec<DeviceConfig>> {
+        let request = GetConfigRequest::new(0);
+        let response: Vec<GetConfigResponse> = broadcast_and_receive(request, self)?;
+        let r = response
+            .into_iter()
+            .map(|r| r.try_into().unwrap())
+            .collect();
+        Ok(r)
+    }
+
+    /// Get all the available [`Device`]s on the local network. This broadcasts a discovery message
+    /// and waits [`Uhppoted::timeout`] for responses.
+    pub fn get_devices(&self) -> Result<Vec<Device>> {
+        let request = GetConfigRequest::new(0);
+        let response: Vec<GetConfigResponse> = broadcast_and_receive(request, self)?;
+        let r = response
+            .into_iter()
+            .map(|r| Device::new(self, r.device_id, Some(r.ip_address)))
+            .collect();
+        Ok(r)
+    }
+
+    /// Get a [`Device`] by its device ID. This does not check if the device actually exists, but
+    /// merely represents a device to interact with.
+    ///
+    /// When `ip_address` is specified, communication will happen directly with the device. Otherwise,
+    /// communication to the device will happen via local network broadcast.
+    ///
+    /// Specify an `ip_address` when the device is not on the local network.
+    pub fn get_device(&self, id: u32, ip_address: Option<Ipv4Addr>) -> Device {
+        Device::new(self, id, ip_address)
+    }
+
+    /// Listen for incoming [`Status`] messages from the UHPPOTE system on a specific `address`.
+    /// Example:
+    /// ```no_run
+    /// use uhppote_rs::Uhppoted;
+    /// let uhppoted = Uhppoted::default();
+    /// let device = uhppoted.get_device(423196779);
+    ///
+    /// let listener_address: SocketAddr = "192.168.0.10:12345".parse().unwrap();
+    ///
+    /// device.set_listener(listener_address).unwrap();
+    /// uhppoted.listen(listener_address, |status| {
+    ///     println!("{:?}", status);
+    /// });
+    /// ```
+    pub fn listen(&self, address: SocketAddr, handler: fn(Status)) -> Result<()> {
+        let socket = UdpSocket::bind(&address)?;
+        socket.set_broadcast(true)?;
+        socket.set_read_timeout(None)?;
         loop {
-            allocated += 16;
-
-            let list = vec![0; allocated].as_mut_ptr();
-            let count = Box::into_raw(Box::new(allocated as i32));
-            unsafe {
-                let err = uhppote_sys::GetDevices(&mut self.u, count, list);
-                if !err.is_null() {
-                    bail!("GetDevice failed: {}", get_string(err)?);
+            let mut buf = [0u8; 64];
+            socket.recv(&mut buf)?;
+            match buf[1].try_into()? {
+                RequestResponseType::Status => {
+                    let response = GetStatusResponse::from_bytes(&buf)?;
+                    handler(response.try_into()?);
                 }
-                if *count as usize <= allocated {
-                    return Ok(CVec::new(list, *count as usize).as_ref().to_vec());
-                }
+                response_type => bail!("Can't listen for {:?}", response_type),
             }
         }
     }
-
-    pub fn get_device(&mut self, id: u32) -> Result<Device> {
-        Ok(Device::new(&mut self.u, id))
-    }
-}
-
-#[derive(Debug)]
-pub struct Device<'a> {
-    u: &'a mut uhppote_sys::UHPPOTE,
-    id: u32,
-}
-
-impl<'a> Device<'a> {
-    pub fn new(u: &'a mut uhppote_sys::UHPPOTE, id: u32) -> Device<'a> {
-        Device { u, id }
-    }
-
-    /// Get a [`DeviceConfig`] for a device id.
-    pub fn get_config(&mut self) -> Result<DeviceConfig> {
-        let mut device: MaybeUninit<uhppote_sys::Device> = MaybeUninit::uninit();
-
-        unsafe {
-            let err = uhppote_sys::GetDevice(&mut *self.u, device.as_mut_ptr(), self.id);
-
-            if !err.is_null() {
-                bail!("GetDevice failed: {}", get_string(err)?);
-            }
-
-            let d = device.assume_init();
-
-            Ok(DeviceConfig {
-                id: d.ID,
-                address: get_string(d.address)?.parse()?,
-                subnet: get_string(d.subnet)?.parse()?,
-                gateway: get_string(d.gateway)?.parse()?,
-                mac: get_string(d.MAC)?,
-                version: get_string(d.version)?,
-                date: NaiveDate::parse_from_str(get_string(d.date)?.as_str(), "%Y-%m-%d")?,
-            })
-        }
-    }
-
-    /// Set the IP address, subnet mask, and gateway of a device.
-    pub fn set_address(&mut self, address: String, subnet: String, gateway: String) -> Result<()> {
-        let address = CString::new(address)?.into_raw();
-        let subnet = CString::new(subnet)?.into_raw();
-        let gateway = CString::new(gateway)?.into_raw();
-        unsafe {
-            let err = uhppote_sys::SetAddress(&mut *self.u, self.id, address, subnet, gateway);
-            if !err.is_null() {
-                bail!("SetAddress failed: {}", get_string(err)?);
-            }
-            Ok(())
-        }
-    }
-
-    /// Get the [`Status`] of a device.
-    pub fn get_status(&mut self) -> Result<Status> {
-        let mut status: MaybeUninit<uhppote_sys::Status> = MaybeUninit::uninit();
-        let mut event: MaybeUninit<uhppote_sys::Event> = MaybeUninit::uninit();
-
-        let mut doors = [0_u8; 4];
-        let mut buttons = [0_u8; 4];
-
-        let status_ptr = status.as_mut_ptr();
-        let event_ptr = event.as_mut_ptr();
-        unsafe {
-            addr_of_mut!((*status_ptr).event).write(event_ptr);
-            addr_of_mut!((*status.as_mut_ptr()).doors).write(doors.as_mut_ptr());
-            addr_of_mut!((*status.as_mut_ptr()).buttons).write(buttons.as_mut_ptr());
-            let err = uhppote_sys::GetStatus(&mut *self.u, status_ptr, self.id);
-
-            if !err.is_null() {
-                bail!("GetStatus failed: {}", get_string(err)?);
-            }
-
-            let s = status.assume_init();
-
-            let doors = CVec::new(s.doors, 4)
-                .as_ref()
-                .iter()
-                .map(|v| *v != 0)
-                .collect::<Vec<bool>>();
-
-            let buttons = CVec::new(s.buttons, 4)
-                .as_ref()
-                .iter()
-                .map(|v| *v != 0)
-                .collect::<Vec<bool>>();
-
-            let event = s.event.as_ref().map(|e| Event {
-                timestamp: NaiveDateTime::parse_from_str(
-                    get_string(e.timestamp).unwrap().as_str(),
-                    "%Y-%m-%d %H:%M:%S",
-                )
-                .unwrap(),
-                index: e.index,
-                event_type: e.eventType.into(),
-                granted: e.granted != 0,
-                door: e.door,
-                direction: e.direction.into(),
-                card: e.card,
-                reason: e.reason.into(),
-            });
-
-            Ok(Status {
-                id: s.ID,
-                doors,
-                buttons,
-                relays: s.relays,
-                inputs: s.inputs,
-                syserror: s.syserror != 0,
-                seqno: s.seqno,
-                info: s.info != 0,
-                sysdatetime: NaiveDateTime::parse_from_str(
-                    get_string(s.sysdatetime)?.as_str(),
-                    "%Y-%m-%d %H:%M:%S",
-                )?,
-                event,
-            })
-        }
-    }
-
-    /// Get the [`NaiveDateTime`] of the device.
-    pub fn get_date_time(&mut self) -> Result<NaiveDateTime> {
-        unsafe {
-            let mut s: *mut c_char = std::ptr::null_mut();
-            let err = uhppote_sys::GetTime(&mut *self.u, &mut s, self.id);
-            if !err.is_null() {
-                bail!("GetTime failed: {}", get_string(err)?);
-            }
-            let time = std::ffi::CStr::from_ptr(s).to_str()?;
-            Ok(NaiveDateTime::parse_from_str(time, "%Y-%m-%d %H:%M:%S")?)
-        }
-    }
-
-    /// Set the date and time of the device.
-    pub fn set_date_time(&mut self, time: NaiveDateTime) -> Result<()> {
-        let time = CString::new(time.format("%Y-%m-%d %H:%M:%S").to_string())?.into_raw();
-        unsafe {
-            let err = uhppote_sys::SetTime(&mut *self.u, self.id, time);
-            if !err.is_null() {
-                bail!("SetTime failed: {}", get_string(err)?);
-            }
-            Ok(())
-        }
-    }
-
-    /// Return the IP address and port to which the selected controller sends events.
-    pub fn get_listener(&mut self) -> Result<SocketAddr> {
-        unsafe {
-            let mut s: *mut c_char = std::ptr::null_mut();
-            let err = uhppote_sys::GetListener(&mut *self.u, &mut s, self.id);
-            if !err.is_null() {
-                bail!("GetTime failed: {}", get_string(err)?);
-            }
-            let listener = std::ffi::CStr::from_ptr(s).to_str()?.to_string();
-            Ok(listener.parse()?)
-        }
-    }
-
-    // Set the IP address and port to which the selected controller sends events.
-    pub fn set_listener(&mut self, listener: SocketAddr) -> Result<()> {
-        let time = CString::new(listener.to_string())?.into_raw();
-        unsafe {
-            let err = uhppote_sys::SetListener(&mut *self.u, self.id, time);
-            if !err.is_null() {
-                bail!("SetListener failed: {}", get_string(err)?);
-            }
-            Ok(())
-        }
-    }
-
-    /// Get the [`DoorControl`] ([`DoorControlMode`] and delay) of a door. Note that the first door id is 1, not 0.
-    pub fn get_door_control(&mut self, door: u8) -> Result<DoorControl> {
-        let mut door_control: MaybeUninit<uhppote_sys::DoorControl> = MaybeUninit::uninit();
-
-        unsafe {
-            let err =
-                uhppote_sys::GetDoorControl(&mut *self.u, door_control.as_mut_ptr(), self.id, door);
-
-            if !err.is_null() {
-                bail!("GetDoorControl failed: {}", get_string(err)?);
-            }
-
-            let d = door_control.assume_init();
-
-            Ok(DoorControl {
-                mode: d.mode.into(),
-                delay: d.delay,
-            })
-        }
-    }
-
-    /// Set the [`DoorControl`] ([`DoorControlMode`] and delay) of a door.Note that the first door id is 1, not 0.
-    pub fn set_door_control(&mut self, door: u8, mode: DoorControlMode, delay: u8) -> Result<()> {
-        unsafe {
-            let err = uhppote_sys::SetDoorControl(&mut *self.u, self.id, door, mode as u8, delay);
-
-            if !err.is_null() {
-                bail!("SetDoorControl failed: {}", get_string(err)?);
-            }
-            Ok(())
-        }
-    }
-
-    /// Open a door. Note that the first door id is 1, not 0.
-    pub fn open_door(&mut self, door: u8) -> Result<()> {
-        unsafe {
-            let err = uhppote_sys::OpenDoor(&mut *self.u, self.id, door);
-
-            if !err.is_null() {
-                bail!("OpenDoor failed: {}", get_string(err)?);
-            }
-            Ok(())
-        }
-    }
-
-    /// Get all the amount of cards in the system.
-    pub fn get_cards(&mut self) -> Result<i32> {
-        let n = Box::into_raw(Box::new(0));
-        unsafe {
-            let err = uhppote_sys::GetCards(&mut *self.u, n, self.id);
-            if !err.is_null() {
-                bail!("GetCards failed: {}", get_string(err)?);
-            }
-            Ok(*n)
-        }
-    }
-
-    /// Get a specific [`Card`] by its index.
-    pub fn get_card_by_index(&mut self, index: u32) -> Result<Card> {
-        let mut card: MaybeUninit<uhppote_sys::Card> = MaybeUninit::uninit();
-        let mut doors = [0_u8; 4];
-
-        unsafe {
-            addr_of_mut!((*card.as_mut_ptr()).doors).write(doors.as_mut_ptr());
-            let err = uhppote_sys::GetCardByIndex(&mut *self.u, card.as_mut_ptr(), self.id, index);
-
-            if !err.is_null() {
-                bail!("GetCardByIndex failed: {}", get_string(err)?);
-            }
-
-            let c = card.assume_init();
-
-            let doors = CVec::new(c.doors, 4)
-                .as_ref()
-                .iter()
-                .map(|v| v.to_owned())
-                .collect::<Vec<u8>>();
-
-            Ok(Card {
-                number: c.card_number,
-                from: get_string(c.from)?,
-                to: get_string(c.to)?,
-                doors,
-            })
-        }
-    }
-
-    /// Get a [`Card`] by its card number.
-    pub fn get_card(&mut self, card_number: u32) -> Result<Card> {
-        let mut card: MaybeUninit<uhppote_sys::Card> = MaybeUninit::uninit();
-        let mut doors = [0_u8; 4];
-
-        unsafe {
-            addr_of_mut!((*card.as_mut_ptr()).doors).write(doors.as_mut_ptr());
-            let err = uhppote_sys::GetCard(&mut *self.u, card.as_mut_ptr(), self.id, card_number);
-
-            if !err.is_null() {
-                bail!("GetCardByIndex failed: {}", get_string(err)?);
-            }
-
-            let c = card.assume_init();
-
-            let doors = CVec::new(c.doors, 4)
-                .as_ref()
-                .iter()
-                .map(|v| v.to_owned())
-                .collect::<Vec<u8>>();
-
-            Ok(Card {
-                number: c.card_number,
-                from: get_string(c.from)?,
-                to: get_string(c.to)?,
-                doors,
-            })
-        }
-    }
-
-    /// Add a [`Card`] to the system.
-    pub fn add_card(&mut self, mut card: Card) -> Result<()> {
-        let card_number = card.number;
-        let from = CString::new(card.from)?.into_raw();
-        let to = CString::new(card.to)?.into_raw();
-        let doors = card.doors.as_mut_ptr();
-        unsafe {
-            let err = uhppote_sys::PutCard(&mut *self.u, self.id, card_number, from, to, doors);
-            if !err.is_null() {
-                bail!("PutCard failed: {}", get_string(err)?);
-            }
-            Ok(())
-        }
-    }
-
-    /// Remove a [`Card`] from the system.
-    pub fn delete_card(&mut self, number: u32) -> Result<()> {
-        unsafe {
-            let err = uhppote_sys::DeleteCard(&mut *self.u, self.id, number);
-            if !err.is_null() {
-                bail!("DeleteCard failed: {}", get_string(err)?);
-            }
-            Ok(())
-        }
-    }
-
-    /// Get the event index.
-    pub fn get_event_index(&mut self) -> Result<u32> {
-        let n = Box::into_raw(Box::new(0));
-        unsafe {
-            let err = uhppote_sys::GetEventIndex(&mut *self.u, n, self.id);
-            if !err.is_null() {
-                bail!("GetEventIndex failed: {}", get_string(err)?);
-            }
-            Ok(*n)
-        }
-    }
-
-    /// Set the event index.
-    pub fn set_event_index(&mut self, index: u32) -> Result<()> {
-        unsafe {
-            let err = uhppote_sys::SetEventIndex(&mut *self.u, self.id, index);
-            if !err.is_null() {
-                bail!("SetEventIndex failed: {}", get_string(err)?);
-            }
-            Ok(())
-        }
-    }
-
-    /// Get an [`Event`] by its index.
-    pub fn get_event(&mut self, index: u32) -> Result<Event> {
-        let mut event: MaybeUninit<uhppote_sys::Event> = MaybeUninit::uninit();
-        unsafe {
-            let err = uhppote_sys::GetEvent(&mut *self.u, event.as_mut_ptr(), self.id, index);
-            if !err.is_null() {
-                bail!("GetEvent failed: {}", get_string(err)?);
-            }
-            let e = event.assume_init();
-            Ok(Event {
-                timestamp: NaiveDateTime::parse_from_str(
-                    get_string(e.timestamp)?.as_str(),
-                    "%Y-%m-%d %H:%M:%S",
-                )?,
-                index: e.index,
-                event_type: e.eventType.into(),
-                granted: e.granted != 0,
-                door: e.door,
-                direction: e.direction.into(),
-                card: e.card,
-                reason: e.reason.into(),
-            })
-        }
-    }
-
-    /// Enable/disable recording of special events
-    pub fn record_special_events(&mut self, enabled: bool) -> Result<()> {
-        unsafe {
-            let err = uhppote_sys::RecordSpecialEvents(&mut *self.u, self.id, enabled as u8);
-            if !err.is_null() {
-                bail!("RecordSpecialEvents failed: {}", get_string(err)?);
-            }
-            Ok(())
-        }
-    }
-
-    /// Get a [`TimeProfile`] by its index.
-    pub fn get_time_profile(&mut self, id: u8) -> Result<TimeProfile> {
-        let mut profile: MaybeUninit<uhppote_sys::TimeProfile> = MaybeUninit::uninit();
-        unsafe {
-            let err = uhppote_sys::GetTimeProfile(&mut *self.u, profile.as_mut_ptr(), self.id, id);
-            if !err.is_null() {
-                bail!("GetTimeProfile failed: {}", get_string(err)?);
-            }
-            let p = profile.assume_init();
-            Ok(TimeProfile {
-                id: p.ID,
-                linked: p.linked,
-                from: NaiveDate::parse_from_str(get_string(p.from)?.as_str(), "%Y-%m-%d")?,
-                to: NaiveDate::parse_from_str(get_string(p.to)?.as_str(), "%Y-%m-%d")?,
-                monday: p.monday != 0,
-                tuesday: p.tuesday != 0,
-                wednesday: p.wednesday != 0,
-                thursday: p.thursday != 0,
-                friday: p.friday != 0,
-                saturday: p.saturday != 0,
-                sunday: p.sunday != 0,
-                segment1_start: NaiveTime::parse_from_str(
-                    get_string(p.segment1start)?.as_str(),
-                    "%H:%M:%S",
-                )?,
-                segment1_end: NaiveTime::parse_from_str(
-                    get_string(p.segment1end)?.as_str(),
-                    "%H:%M:%S",
-                )?,
-                segment2_start: NaiveTime::parse_from_str(
-                    get_string(p.segment2start)?.as_str(),
-                    "%H:%M:%S",
-                )?,
-                segment2_end: NaiveTime::parse_from_str(
-                    get_string(p.segment2end)?.as_str(),
-                    "%H:%M:%S",
-                )?,
-                segment3_start: NaiveTime::parse_from_str(
-                    get_string(p.segment3start)?.as_str(),
-                    "%H:%M:%S",
-                )?,
-                segment3_end: NaiveTime::parse_from_str(
-                    get_string(p.segment3end)?.as_str(),
-                    "%H:%M:%S",
-                )?,
-            })
-        }
-    }
-
-    /// Set a [`TimeProfile`] by its index. Note that profile ID has to be larger than 1.
-    pub fn set_time_profile(&mut self, profile: TimeProfile) -> Result<()> {
-        if profile.id <= 1 {
-            bail!("Invalid profile ID. Must be greater than 1");
-        }
-
-        let mut p = uhppote_sys::TimeProfile {
-            ID: profile.id,
-            linked: profile.linked,
-            from: CString::new(profile.from.format("%Y-%m-%d").to_string())?.into_raw(),
-            to: CString::new(profile.to.format("%Y-%m-%d").to_string())?.into_raw(),
-            monday: profile.monday as u8,
-            tuesday: profile.tuesday as u8,
-            wednesday: profile.wednesday as u8,
-            thursday: profile.thursday as u8,
-            friday: profile.friday as u8,
-            saturday: profile.saturday as u8,
-            sunday: profile.sunday as u8,
-            segment1start: CString::new(profile.segment1_start.format("%H:%M").to_string())?
-                .into_raw(),
-            segment1end: CString::new(profile.segment1_end.format("%H:%M").to_string())?.into_raw(),
-            segment2start: CString::new(profile.segment2_start.format("%H:%M").to_string())?
-                .into_raw(),
-            segment2end: CString::new(profile.segment2_end.format("%H:%M").to_string())?.into_raw(),
-            segment3start: CString::new(profile.segment3_start.format("%H:%M").to_string())?
-                .into_raw(),
-            segment3end: CString::new(profile.segment3_end.format("%H:%M").to_string())?.into_raw(),
-        };
-        unsafe {
-            let err = uhppote_sys::SetTimeProfile(&mut *self.u, self.id, &mut p);
-            if !err.is_null() {
-                bail!("SetTimeProfile failed: {}", get_string(err)?);
-            }
-            Ok(())
-        }
-    }
-
-    /// Clear all [`TimeProfile`]s.
-    pub fn clear_time_profiles(&mut self) -> Result<()> {
-        unsafe {
-            let err = uhppote_sys::ClearTimeProfiles(&mut *self.u, self.id);
-            if !err.is_null() {
-                bail!("ClearTimeProfiles failed: {}", get_string(err)?);
-            }
-            Ok(())
-        }
-    }
-
-    /// Add a [`Task`] to the system.
-    pub fn add_task(&mut self, task: Task) -> Result<()> {
-        let mut t = uhppote_sys::Task {
-            task: task.task as u8,
-            door: task.door,
-            from: CString::new(task.from.format("%Y-%m-%d").to_string())?.into_raw(),
-            to: CString::new(task.to.format("%Y-%m-%d").to_string())?.into_raw(),
-            monday: task.monday as u8,
-            tuesday: task.tuesday as u8,
-            wednesday: task.wednesday as u8,
-            thursday: task.thursday as u8,
-            friday: task.friday as u8,
-            saturday: task.saturday as u8,
-            sunday: task.sunday as u8,
-            at: CString::new(task.at.format("%Y-%m-%d").to_string())?.into_raw(),
-            cards: task.cards,
-        };
-
-        unsafe {
-            let err = uhppote_sys::AddTask(&mut *self.u, self.id, &mut t);
-            if !err.is_null() {
-                bail!("AddTask failed: {}", get_string(err)?);
-            }
-            Ok(())
-        }
-    }
-
-    /// Refresh the task list.
-    pub fn refresh_task_list(&mut self) -> Result<()> {
-        unsafe {
-            let err = uhppote_sys::RefreshTaskList(&mut *self.u, self.id);
-            if !err.is_null() {
-                bail!("RefreshTasklist failed: {}", get_string(err)?);
-            }
-            Ok(())
-        }
-    }
-
-    /// Clear the task list
-    pub fn clear_task_list(&mut self) -> Result<()> {
-        unsafe {
-            let err = uhppote_sys::ClearTaskList(&mut *self.u, self.id);
-            if !err.is_null() {
-                bail!("ClearTaskList failed: {}", get_string(err)?);
-            }
-            Ok(())
-        }
-    }
-}
-
-unsafe fn get_string(ptr: *mut ::std::os::raw::c_char) -> Result<String> {
-    Ok(CStr::from_ptr(ptr).to_str()?.to_string())
 }
 
 impl Default for Uhppoted {
     /// Creates a default instance of [`Uhppoted`].
     /// Defaults:
-    ///   -`bind`: 0.0.0.0:0
-    ///   - `broadcast`: 255.255.255.255:60000
+    ///   - `bind`: 0.0.0.0:0
+    ///   - `broadcast`: 255.255.255.255
     ///   - `listen`: None
-    ///   - `timeout`: 5000
-    ///   - `controllers`: vec![]
-    ///   - `debug`: false
+    ///   - `timeout`: Duration::new(5, 0)
+    ///   - `controllers`: None
     fn default() -> Uhppoted {
         Uhppoted::new(
             "0.0.0.0:0".parse().unwrap(),
-            "255.255.255.255:60000".parse().unwrap(),
-            None,
-            5000,
-            vec![],
-            false,
+            "255.255.255.255".parse().unwrap(),
+            Duration::new(5, 0),
         )
-        .unwrap()
     }
 }
 
-/// Defines a specific controller that can be used by the [`Uhppoted`] instance.
-pub struct Controller {
+#[derive(Debug)]
+pub struct Device<'a> {
+    u: &'a Uhppoted,
     id: u32,
-    address: SocketAddr,
+    ip_address: Option<Ipv4Addr>,
 }
 
-/// Configuration of a [`Device`]
-#[derive(Debug)]
-pub struct DeviceConfig {
-    pub id: u32,
-    pub address: Ipv4Addr,
-    pub subnet: Ipv4Addr,
-    pub gateway: Ipv4Addr,
-    pub mac: String,
-    pub version: String,
-    pub date: NaiveDate,
-}
+impl<'a> Device<'a> {
+    /// Create a new [`Device`] from an [`Uhppoted`] and a device ID.
+    fn new(u: &'a Uhppoted, id: u32, ip_address: Option<Ipv4Addr>) -> Device<'a> {
+        Device { u, id, ip_address }
+    }
 
-/// Status of a [`Device`]
-#[derive(Debug)]
-pub struct Status {
-    pub id: u32,
-    pub sysdatetime: NaiveDateTime,
-    pub doors: Vec<bool>,
-    pub buttons: Vec<bool>,
-    pub relays: u8,
-    pub inputs: u8,
-    pub syserror: bool,
-    pub info: bool,
-    pub seqno: u32,
-    pub event: Option<Event>,
-}
+    /// Add a [`Card`] to the [`Device`].
+    pub fn add_card(&self, card: Card) -> Result<()> {
+        let request = PutCardRequest::new(
+            self.id,
+            card.number,
+            card.from.try_into()?,
+            card.to.try_into()?,
+            card.doors[0],
+            card.doors[1],
+            card.doors[2],
+            card.doors[3],
+        );
+        let response: PutCardResponse = send_and_receive(request, self)?;
+        if response.success {
+            Ok(())
+        } else {
+            bail!("PutCard failed")
+        }
+    }
 
-/// Event that occurred on a [`Device`]
-#[derive(Debug)]
-pub struct Event {
-    pub timestamp: NaiveDateTime,
-    pub index: u32,
-    pub event_type: EventType,
-    pub granted: bool,
-    pub door: u8,
-    pub direction: Direction,
-    pub card: u32,
-    pub reason: EventReason,
-}
+    /// Add a [`Task`] to the system.
+    pub fn add_task(&self, task: Task) -> Result<()> {
+        let request = AddTaskRequest::new(
+            self.id,
+            DateBCD::new(
+                task.from.year() as u16,
+                task.from.month() as u8,
+                task.from.day() as u8,
+            ),
+            DateBCD::new(
+                task.to.year() as u16,
+                task.to.month() as u8,
+                task.to.day() as u8,
+            ),
+            task.monday,
+            task.tuesday,
+            task.wednesday,
+            task.thursday,
+            task.friday,
+            task.saturday,
+            task.sunday,
+            task.at.try_into()?,
+            task.door,
+            task.task as u8,
+            task.more_cards,
+        );
 
-#[derive(Debug)]
-pub struct DoorControl {
-    pub mode: DoorControlMode,
-    pub delay: u8,
-}
+        let response: AddTaskResponse = send_and_receive(request, self)?;
 
-#[derive(Debug)]
-pub enum DoorControlMode {
-    NormallyOpen = 1,
-    NormallyClosed = 2,
-    Controlled = 3,
-    Unknown,
-}
+        if response.success {
+            Ok(())
+        } else {
+            bail!("AddTask failed")
+        }
+    }
 
-impl From<u8> for DoorControlMode {
-    fn from(mode: u8) -> DoorControlMode {
-        match mode {
-            1 => DoorControlMode::NormallyOpen,
-            2 => DoorControlMode::NormallyClosed,
-            3 => DoorControlMode::Controlled,
-            _ => DoorControlMode::Unknown,
+    /// Remove all [`Card`]s from the [`Device`].
+    pub fn clear_cards(&self) -> Result<()> {
+        let magic_word = 0x55aaaa55;
+        let request = DeleteCardsRequest::new(self.id, magic_word);
+        let response: DeleteCardsResponse = send_and_receive(request, self)?;
+        if response.success {
+            Ok(())
+        } else {
+            bail!("DeleteCard failed")
+        }
+    }
+
+    /// Remove all [`Task`]s from the [`Device`].
+    pub fn clear_tasks(&self) -> Result<()> {
+        let request = ClearTaskListRequest::new(self.id, 0x55aaaa55);
+        let response: ClearTaskListResponse = send_and_receive(request, self)?;
+        if response.success {
+            Ok(())
+        } else {
+            bail!("ClearTaskList failed")
+        }
+    }
+
+    /// Remove all [`TimeProfile`]s from the [`Device`].
+    pub fn clear_time_profiles(&self) -> Result<()> {
+        let magic_word = 0x55aaaa55;
+        let request = ClearTimeProfilesRequest::new(self.id, magic_word);
+        let response: ClearTimeProfilesResponse = send_and_receive(request, self)?;
+        if response.magic_word == magic_word {
+            Ok(())
+        } else {
+            bail!("ClearTimeProfiles failed")
+        }
+    }
+
+    /// Remove a [`Card`] from the [`Device`].
+    pub fn delete_card(&self, number: u32) -> Result<()> {
+        let request = DeleteCardRequest::new(self.id, number);
+        let response: DeleteCardResponse = send_and_receive(request, self)?;
+        if response.success {
+            Ok(())
+        } else {
+            bail!("DeleteCard failed")
+        }
+    }
+
+    /// Get a specific [`Card`] by its ID.
+    pub fn get_card_by_id(&self, id: u32) -> Result<Card> {
+        let request = GetCardByIDRequest::new(self.id, id);
+        let response: GetCardByIDResponse = send_and_receive(request, self)?;
+        response.try_into()
+    }
+
+    /// Get a specific [`Card`] by its index.
+    pub fn get_card_by_index(&self, index: u32) -> Result<Card> {
+        let request = GetCardByIndexRequest::new(self.id, index);
+        let response: GetCardByIndexResponse = send_and_receive(request, self)?;
+        response.try_into()
+    }
+
+    /// Get the number of [`Card`]s from the [`Device`].
+    pub fn get_cards(&self) -> Result<u32> {
+        let request = GetCardsRequest::new(self.id);
+        let response: GetCardsResponse = send_and_receive(request, self)?;
+        Ok(response.records)
+    }
+
+    /// Get a [`DeviceConfig`] for a the [`Device`].
+    pub fn get_config(&self) -> Result<DeviceConfig> {
+        let request = GetConfigRequest::new(self.id);
+        let response: GetConfigResponse = send_and_receive(request, self)?;
+        response.try_into()
+    }
+
+    /// Get a [`DoorControl`] for a specific door.
+    /// Note that doors are addressed 1-4, not 0-3.
+    pub fn get_door_control(&self, door: u8) -> Result<DoorControl> {
+        let request = GetDoorControlStateRequest::new(self.id, door);
+        let response: GetDoorControlStateResponse = send_and_receive(request, self)?;
+        Ok(response.into())
+    }
+
+    /// Get an [`Event`] by its index.
+    pub fn get_event(&self, index: u32) -> Result<Event> {
+        let request = GetEventRequest::new(self.id, index);
+        let response: GetEventResponse = send_and_receive(request, self)?;
+        response.try_into()
+    }
+
+    /// Get the event index the [`Device`]
+    pub fn get_event_index(&self) -> Result<u32> {
+        let request = GetEventIndexRequest::new(self.id);
+        let response: GetEventIndexResponse = send_and_receive(request, self)?;
+        Ok(response.index)
+    }
+
+    /// Get what listener (IP:PORT) is set on the [`Device`]. This is where the the [`Device`]
+    /// will send [`Status`] messages to over UDP.
+    pub fn get_listener(&self) -> Result<SocketAddr> {
+        let request = GetListenerRequest::new(self.id);
+        let response: GetListenerResponse = send_and_receive(request, self)?;
+        Ok(SocketAddr::from((response.ip_address, response.port)))
+    }
+
+    /// Get the [`Status`] of the [`Device`].
+    pub fn get_status(&self) -> Result<Status> {
+        let request = GetStatusRequest::new(self.id);
+        let response: GetStatusResponse = send_and_receive(request, self)?;
+        let status: Status = response.try_into()?;
+        Ok(status)
+    }
+
+    /// Get the current time of the [`Device`].
+    pub fn get_time(&self) -> Result<NaiveDateTime> {
+        let request = GetTimeRequest::new(self.id);
+        let response: GetTimeResponse = send_and_receive(request, self)?;
+        response.datetime.try_into()
+    }
+
+    /// Get the [`TimeProfile`] by ID.
+    pub fn get_time_profile(&self, profile_id: u8) -> Result<TimeProfile> {
+        let request = GetTimeProfileRequest::new(self.id, profile_id);
+        let response: GetTimeProfileResponse = send_and_receive(request, self)?;
+        response.try_into()
+    }
+
+    /// Open a door.
+    /// Note that doors are addressed 1-4, not 0-3.
+    pub fn open_door(&self, door: u8) -> Result<()> {
+        let request = OpenDoorRequest::new(self.id, door);
+        let response: OpenDoorResponse = send_and_receive(request, self)?;
+        if response.success {
+            Ok(())
+        } else {
+            bail!("OpenDoor failed")
+        }
+    }
+
+    /// Refresh the task list of the [`Device`].
+    pub fn refresh_task_list(&self) -> Result<()> {
+        let request = RefreshTaskListRequest::new(self.id, 0x55aaaa55);
+        let response: RefreshTaskListResponse = send_and_receive(request, self)?;
+        if response.success {
+            Ok(())
+        } else {
+            bail!("RefreshTaskList failed")
+        }
+    }
+
+    /// Set the [`DoorControl`] for a specific door.
+    /// Note that the delay is in seconds and can maximally be 255.
+    pub fn set_door_control_state(
+        &self,
+        door: u8,
+        state: DoorControl,
+        delay: Duration,
+    ) -> Result<DoorControl> {
+        let request =
+            SetDoorControlStateRequest::new(self.id, door, state.mode as u8, delay.as_secs() as u8);
+        let response: SetDoorControlStateResponse = send_and_receive(request, self)?;
+        Ok(response.into())
+    }
+
+    /// Set the event index the [`Device`] will use.
+    pub fn set_event_index(&self, index: u32) -> Result<()> {
+        let request = SetEventIndexRequest::new(self.id, index, 0x55aaaa55);
+        let response: SetEventIndexResponse = send_and_receive(request, self)?;
+        if response.success {
+            Ok(())
+        } else {
+            bail!("SetEventIndex failed")
+        }
+    }
+
+    /// Set the listener (IP:PORT) the [`Device`] will use to send [`Status`] messages to over UDP.
+    pub fn set_listener(&self, address: Ipv4Addr, port: u16) -> Result<()> {
+        let request = SetListenerRequest::new(self.id, address, port);
+        let response: SetListenerResponse = send_and_receive(request, self)?;
+        if response.success {
+            Ok(())
+        } else {
+            bail!("SetListener failed")
+        }
+    }
+
+    /// Set IP address, subnet mask and gateway for the [`Device`].
+    pub fn set_network_config(
+        &self,
+        address: Ipv4Addr,
+        subnet: Ipv4Addr,
+        gateway: Ipv4Addr,
+    ) -> Result<()> {
+        let request = SetAddressRequest::new(self.id, address, subnet, gateway, 0x55aaaa55);
+
+        send(request, self)
+    }
+
+    /// Enable the recording of special events.
+    pub fn enable_record_special_events(&self, enable: bool) -> Result<()> {
+        let request = SetRecordSpecialEventsRequest::new(self.id, enable);
+        let response: SetRecordSpecialEventsResponse = send_and_receive(request, self)?;
+        if response.success {
+            Ok(())
+        } else {
+            bail!("SetRecordSpecialEvents failed")
+        }
+    }
+
+    /// Set the local time of the [`Device`].
+    pub fn set_time(&self, datetime: NaiveDateTime) -> Result<NaiveDateTime> {
+        let request = SetTimeRequest::new(self.id, datetime.try_into()?);
+        let response: SetTimeResponse = send_and_receive(request, self)?;
+        response.datetime.try_into()
+    }
+
+    /// Add or update new [`TimeProfile`] to the [`Device`].
+    pub fn add_or_update_time_profile(&self, profile: TimeProfile) -> Result<()> {
+        let request = SetTimeProfileRequest::new(
+            self.id,
+            profile.id,
+            profile.from.try_into()?,
+            profile.to.try_into()?,
+            profile.monday,
+            profile.tuesday,
+            profile.wednesday,
+            profile.thursday,
+            profile.friday,
+            profile.saturday,
+            profile.sunday,
+            profile.segments[0].start.try_into()?,
+            profile.segments[0].end.try_into()?,
+            profile.segments[1].start.try_into()?,
+            profile.segments[1].end.try_into()?,
+            profile.segments[2].start.try_into()?,
+            profile.segments[2].end.try_into()?,
+            profile.linked_profile_id,
+        );
+        let response: SetTimeProfileResponse = send_and_receive(request, self)?;
+        if response.success {
+            Ok(())
+        } else {
+            bail!("SetTimeProfile failed")
         }
     }
 }
 
-#[derive(Debug)]
-pub enum Direction {
-    In = 1,
-    Out = 2,
-    Unknown,
+/// Send a [`Request`] and receive a [`Response`].
+fn send_and_receive<T: messages::Request, S: messages::Response + Debug>(
+    request: T,
+    d: &Device,
+) -> Result<S> {
+    let socket = setup_socket(d.u)?;
+    let addr = get_address(d);
+    socket.send_to(
+        &request.to_bytes(),
+        &SocketAddr::new(addr.into(), UHPPOTE_PORT),
+    )?;
+
+    // Receive the response
+    let mut buf = [0u8; 64];
+    socket.recv(&mut buf)?;
+
+    S::from_bytes(&buf)
 }
 
-impl From<u8> for Direction {
-    fn from(direction: u8) -> Direction {
-        match direction {
-            1 => Direction::In,
-            2 => Direction::Out,
-            _ => Direction::Unknown,
-        }
+/// Send a [`Request`] to the [`Device`], but don't expect a response.
+fn send<T: messages::Request>(request: T, d: &Device) -> Result<()> {
+    let socket = setup_socket(d.u)?;
+    let addr = get_address(d);
+    socket.send_to(
+        &request.to_bytes(),
+        &SocketAddr::new(addr.into(), UHPPOTE_PORT),
+    )?;
+    Ok(())
+}
+
+/// Get the IP address of the [`Device`]. If None, use the broadcast address from [`Uhppoted`]
+fn get_address(d: &Device) -> Ipv4Addr {
+    match d.ip_address {
+        Some(ip) => ip,
+        None => d.u.broadcast_address,
     }
 }
 
-#[derive(Debug)]
-pub enum EventType {
-    None = 0,
-    Swipe = 1,
-    Door = 2,
-    Alarm = 3,
-    Overwritten = 255,
+/// Setup a socket with correct timeouts.
+fn setup_socket(u: &Uhppoted) -> Result<UdpSocket, anyhow::Error> {
+    let socket = UdpSocket::bind(u.bind_address)?;
+    socket.set_write_timeout(Some(Duration::new(1, 0)))?;
+    socket.set_read_timeout(Some(u.timeout))?;
+    socket.set_broadcast(true)?;
+    Ok(socket)
 }
 
-impl From<u8> for EventType {
-    fn from(event_type: u8) -> EventType {
-        match event_type {
-            0 => EventType::None,
-            1 => EventType::Swipe,
-            2 => EventType::Door,
-            3 => EventType::Alarm,
-            255 => EventType::Overwritten,
-            _ => EventType::None,
-        }
+/// Broadcast a [`Request`] to all [`Device`]s.
+fn broadcast_and_receive<T: messages::Request, S: messages::Response + Debug>(
+    request: T,
+    u: &Uhppoted,
+) -> Result<Vec<S>> {
+    let socket = setup_socket(u)?;
+
+    let to_addr = SocketAddr::new(u.broadcast_address.into(), UHPPOTE_PORT);
+
+    socket.send_to(&request.to_bytes(), to_addr)?;
+    let mut buf = [0u8; 64];
+
+    let mut ret = Vec::new();
+
+    while let Ok((_, _)) = socket.recv_from(&mut buf) {
+        ret.push(S::from_bytes(&buf)?);
     }
-}
 
-#[derive(Debug)]
-pub enum EventReason {
-    None = 0,
-    Swipe = 1,
-    Denied = 5,
-    NoAccessRights = 6,
-    IncorrectPassword = 7,
-    AntiPassback = 8,
-    MoreCards = 9,
-    FirstCardOpen = 10,
-    DoorIsNormallyClosed = 11,
-    Interlock = 12,
-    NotInAllowedTimePeriod = 13,
-    InvalidTimeZone = 15,
-    AccessDenied = 18,
-    PushButtonOk = 20,
-    DoorOpen = 23,
-    DoorClosed = 24,
-    DoorOpenedSupervisorPassword = 25,
-    ControllerPowerOn = 28,
-    ControllerReset = 29,
-    PushbuttonInvalidDoorLocked = 31,
-    PushbuttonInvalidDoorOffline = 32,
-    PushbuttonInvalidDoorInterlock = 33,
-    PushbuttonInvalidDoorThreat = 34,
-    DoorOpenTooLong = 37,
-    ForcedOpen = 38,
-    Fire = 39,
-    ForcedClosed = 40,
-    TheftPrevention = 41,
-    TwentyFourSevenZone = 42,
-    Emergency = 43,
-    RemoteOpenDoor = 44,
-    RemoteOpenDoorUsbReader = 45,
-}
-
-impl From<u8> for EventReason {
-    fn from(reason: u8) -> EventReason {
-        match reason {
-            0 => EventReason::None,
-            1 => EventReason::Swipe,
-            5 => EventReason::Denied,
-            6 => EventReason::NoAccessRights,
-            7 => EventReason::IncorrectPassword,
-            8 => EventReason::AntiPassback,
-            9 => EventReason::MoreCards,
-            10 => EventReason::FirstCardOpen,
-            11 => EventReason::DoorIsNormallyClosed,
-            12 => EventReason::Interlock,
-            13 => EventReason::NotInAllowedTimePeriod,
-            15 => EventReason::InvalidTimeZone,
-            18 => EventReason::AccessDenied,
-            20 => EventReason::PushButtonOk,
-            23 => EventReason::DoorOpen,
-            24 => EventReason::DoorClosed,
-            25 => EventReason::DoorOpenedSupervisorPassword,
-            28 => EventReason::ControllerPowerOn,
-            29 => EventReason::ControllerReset,
-            31 => EventReason::PushbuttonInvalidDoorLocked,
-            32 => EventReason::PushbuttonInvalidDoorOffline,
-            33 => EventReason::PushbuttonInvalidDoorInterlock,
-            34 => EventReason::PushbuttonInvalidDoorThreat,
-            37 => EventReason::DoorOpenTooLong,
-            38 => EventReason::ForcedOpen,
-            39 => EventReason::Fire,
-            40 => EventReason::ForcedClosed,
-            41 => EventReason::TheftPrevention,
-            42 => EventReason::TwentyFourSevenZone,
-            43 => EventReason::Emergency,
-            44 => EventReason::RemoteOpenDoor,
-            45 => EventReason::RemoteOpenDoorUsbReader,
-            _ => EventReason::None,
-        }
-    }
-}
-
-#[derive(Debug)]
-pub struct Card {
-    pub number: u32,
-    pub from: String,
-    pub to: String,
-    pub doors: Vec<u8>,
-}
-
-#[derive(Debug)]
-pub struct TimeProfile {
-    pub id: u8,
-    pub linked: u8,
-    pub from: NaiveDate,
-    pub to: NaiveDate,
-    pub monday: bool,
-    pub tuesday: bool,
-    pub wednesday: bool,
-    pub thursday: bool,
-    pub friday: bool,
-    pub saturday: bool,
-    pub sunday: bool,
-    pub segment1_start: NaiveTime,
-    pub segment1_end: NaiveTime,
-    pub segment2_start: NaiveTime,
-    pub segment2_end: NaiveTime,
-    pub segment3_start: NaiveTime,
-    pub segment3_end: NaiveTime,
-}
-
-#[derive(Debug)]
-#[repr(u8)]
-pub enum TaskID {
-    ControlDoor = 1,
-    UnlockDoor = 2,
-    LockDoor = 3,
-    DisableTimeProfile = 4,
-    EnableTimeProfile = 5,
-    EnableCardNoPassword = 6,
-    EnableCardWithInPassword = 7,
-    EnableCardWithPassword = 8,
-    EnableMoreCards = 9,
-    DisableMoreCards = 10,
-    TriggerOnce = 11,
-    DisablePushButton = 12,
-    EnablePushButton = 13,
-}
-
-impl From<u8> for TaskID {
-    fn from(task: u8) -> TaskID {
-        match task {
-            1 => TaskID::ControlDoor,
-            2 => TaskID::UnlockDoor,
-            3 => TaskID::LockDoor,
-            4 => TaskID::DisableTimeProfile,
-            5 => TaskID::EnableTimeProfile,
-            6 => TaskID::EnableCardNoPassword,
-            7 => TaskID::EnableCardWithInPassword,
-            8 => TaskID::EnableCardWithPassword,
-            9 => TaskID::EnableMoreCards,
-            10 => TaskID::DisableMoreCards,
-            11 => TaskID::TriggerOnce,
-            12 => TaskID::DisablePushButton,
-            13 => TaskID::EnablePushButton,
-            _ => TaskID::ControlDoor,
-        }
-    }
-}
-
-#[derive(Debug)]
-pub struct Task {
-    pub task: TaskID,
-    pub door: u8,
-    pub from: NaiveDate,
-    pub to: NaiveDate,
-    pub monday: bool,
-    pub tuesday: bool,
-    pub wednesday: bool,
-    pub thursday: bool,
-    pub friday: bool,
-    pub saturday: bool,
-    pub sunday: bool,
-    pub at: NaiveTime,
-    pub cards: u8,
+    Ok(ret)
 }
