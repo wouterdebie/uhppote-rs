@@ -59,8 +59,8 @@ pub use set_time::*;
 pub use set_time_profile::*;
 pub use utils::*;
 
-use request_derive::Request;
-use request_derive::Response;
+use uhppote_derive::Request;
+use uhppote_derive::Response;
 
 #[derive(Debug)]
 pub enum RequestResponseType {
