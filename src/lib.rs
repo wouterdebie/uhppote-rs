@@ -362,14 +362,13 @@ impl<'a> Device<'a> {
 
     /// Set the [`DoorControl`] for a specific door.
     /// Note that the delay is in seconds and can maximally be 255.
-    pub fn set_door_control_state(
-        &self,
-        door: u8,
-        state: DoorControl,
-        delay: Duration,
-    ) -> Result<DoorControl> {
-        let request =
-            SetDoorControlStateRequest::new(self.id, door, state.mode as u8, delay.as_secs() as u8);
+    pub fn set_door_control_state(&self, door: u8, state: DoorControl) -> Result<DoorControl> {
+        let request = SetDoorControlStateRequest::new(
+            self.id,
+            door,
+            state.mode as u8,
+            state.delay.as_secs() as u8,
+        );
         let response: SetDoorControlStateResponse = send_and_receive(request, self)?;
         Ok(response.into())
     }
