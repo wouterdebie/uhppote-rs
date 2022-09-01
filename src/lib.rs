@@ -7,9 +7,9 @@
 //!
 //! Example:
 //! ```no_run
-//! use uhppote_rs::Uhppote;
+//! use uhppote_rs::Uhppoted;
 //! let uhppoted = Uhppoted::default();
-//! let device = uhppoted.get_device(423196779).unwrap();
+//! let device = uhppoted.get_device(423196779, None);
 //! let status = device.get_status().unwrap();
 //! ```
 mod messages;
@@ -43,13 +43,11 @@ impl Uhppoted {
     /// Example:
     /// ```no_run
     /// use uhppote_rs::Uhppoted;
-    /// let uhppoted = UUhppoted::new(
+    /// let uhppoted = Uhppoted::new(
     ///     "0.0.0.0:0".parse().unwrap(),
     ///     "255.255.255.255".parse().unwrap(),
-    ///     Duration::new(5, 0),
-    ///     Vec::new(),
-    ///     false,
-    /// )
+    ///     std::time::Duration::new(5, 0),
+    /// );
     pub fn new(bind: SocketAddr, broadcast: Ipv4Addr, timeout: Duration) -> Uhppoted {
         Uhppoted {
             bind_address: bind,
@@ -98,12 +96,11 @@ impl Uhppoted {
     /// ```no_run
     /// use uhppote_rs::Uhppoted;
     /// let uhppoted = Uhppoted::default();
-    /// let device = uhppoted.get_device(423196779);
+    /// let device = uhppoted.get_device(423196779, None);
     ///
-    /// let listener_address: SocketAddr = "192.168.0.10:12345".parse().unwrap();
-    ///
-    /// device.set_listener(listener_address).unwrap();
-    /// uhppoted.listen(listener_address, |status| {
+    /// let (ip, port) = (std::net::Ipv4Addr::new(192, 168, 0, 10), 12345);
+    /// device.set_listener(ip, port).unwrap();
+    /// uhppoted.listen(std::net::SocketAddr::new(std::net::IpAddr::V4(ip), port), |status| {
     ///     println!("{:?}", status);
     /// });
     /// ```
