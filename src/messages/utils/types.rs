@@ -57,12 +57,14 @@ impl TryInto<NaiveDate> for DateBCD {
     }
 }
 
-#[test]
-fn test_date_bcd_into_naive_date() {
-    let date = NaiveDate::from_ymd(2019, 1, 1);
-    let bcd = DateBCD::new(2019, 1, 1);
-    let converted: NaiveDate = bcd.try_into().unwrap();
-    assert_eq!(converted, date);
+impl Display for DateBCD {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(
+            f,
+            "{:02x}{:02x}-{:02x}-{:02x}",
+            self.date.0, self.date.1, self.date.2, self.date.3
+        )
+    }
 }
 
 impl TryFrom<NaiveDate> for DateBCD {
@@ -74,30 +76,6 @@ impl TryFrom<NaiveDate> for DateBCD {
             date.day() as u8,
         ))
     }
-}
-
-#[test]
-fn test_date_bcd_from_naive_date() {
-    let date = NaiveDate::from_ymd(2019, 1, 1);
-    let bcd = DateBCD::new(2019, 1, 1);
-    let converted = DateBCD::try_from(date).unwrap();
-    assert_eq!(converted, bcd);
-}
-
-impl Display for DateBCD {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(
-            f,
-            "{:02x}{:02x}-{:02x}-{:02x}",
-            self.date.0, self.date.1, self.date.2, self.date.3
-        )
-    }
-}
-
-#[test]
-fn test_date_bcd_display() {
-    let date = DateBCD::new(2019, 1, 1);
-    assert_eq!(date.to_string(), "2019-01-01");
 }
 
 // TimeWithoutSecondsBCD
@@ -127,38 +105,17 @@ impl TryFrom<NaiveTime> for TimeWithoutSecondsBCD {
     }
 }
 
-#[test]
-fn test_time_without_seconds_bcd_from_naive_time() {
-    let time = NaiveTime::from_hms(8, 12, 0);
-    let bcd = TimeWithoutSecondsBCD::new(8, 12);
-    let converted = TimeWithoutSecondsBCD::try_from(time).unwrap();
-    assert_eq!(converted, bcd);
-}
-
 impl TryInto<NaiveTime> for TimeWithoutSecondsBCD {
     type Error = anyhow::Error;
     fn try_into(self) -> Result<NaiveTime> {
         Ok(NaiveTime::parse_from_str(&self.to_string(), "%H:%M")?)
     }
 }
-#[test]
-fn test_time_without_seconds_bcd_into_naive_time() {
-    let time = NaiveTime::from_hms(8, 12, 0);
-    let bcd = TimeWithoutSecondsBCD::new(8, 12);
-    let converted: NaiveTime = bcd.try_into().unwrap();
-    assert_eq!(converted, time);
-}
 
 impl Display for TimeWithoutSecondsBCD {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(f, "{:02x}:{:02x}", self.hour, self.minute,)
     }
-}
-
-#[test]
-fn test_time_without_seconds_bcd_display() {
-    let time = TimeWithoutSecondsBCD::new(8, 12);
-    assert_eq!(time.to_string(), "08:12");
 }
 
 // TimeWithSecondsBCD
@@ -191,27 +148,11 @@ impl TryFrom<NaiveTime> for TimeWithSecondsBCD {
     }
 }
 
-#[test]
-fn test_time_with_seconds_bcd_from_naive_time() {
-    let time = NaiveTime::from_hms(8, 12, 13);
-    let bcd = TimeWithSecondsBCD::new(8, 12, 13);
-    let converted = TimeWithSecondsBCD::try_from(time).unwrap();
-    assert_eq!(converted, bcd);
-}
-
 impl TryInto<NaiveTime> for TimeWithSecondsBCD {
     type Error = anyhow::Error;
     fn try_into(self) -> Result<NaiveTime> {
         Ok(NaiveTime::parse_from_str(&self.to_string(), "%H:%M:%S")?)
     }
-}
-
-#[test]
-fn test_time_with_seconds_bcd_into_naive_time() {
-    let time = NaiveTime::from_hms(8, 12, 13);
-    let bcd = TimeWithSecondsBCD::new(8, 12, 13);
-    let converted: NaiveTime = bcd.try_into().unwrap();
-    assert_eq!(converted, time);
 }
 
 impl Display for TimeWithSecondsBCD {
@@ -222,12 +163,6 @@ impl Display for TimeWithSecondsBCD {
             self.hour, self.minute, self.second
         )
     }
-}
-
-#[test]
-fn test_time_with_seconds_bcd_display() {
-    let time = TimeWithSecondsBCD::new(8, 12, 13);
-    assert_eq!(time.to_string(), "08:12:13");
 }
 
 #[derive(bincode::Decode, bincode::Encode, PartialEq, Eq, Debug, Default)]
@@ -259,15 +194,6 @@ impl TryFrom<NaiveDateTime> for DateTime {
     }
 }
 
-#[test]
-fn test_date_time_bcd_from_naive_time() {
-    let date_time =
-        NaiveDateTime::parse_from_str("2019-08-01 08:31:22", "%Y-%m-%d %H:%M:%S").unwrap();
-    let bcd = DateTime::new(2019, 8, 1, 8, 31, 22);
-    let converted = DateTime::try_from(date_time).unwrap();
-    assert_eq!(converted, bcd);
-}
-
 impl TryInto<NaiveDateTime> for DateTime {
     type Error = anyhow::Error;
     fn try_into(self) -> Result<NaiveDateTime> {
@@ -278,25 +204,10 @@ impl TryInto<NaiveDateTime> for DateTime {
     }
 }
 
-#[test]
-fn test_date_time_bcd_into_naive_date_time() {
-    let date_time =
-        NaiveDateTime::parse_from_str("2019-08-01 08:31:22", "%Y-%m-%d %H:%M:%S").unwrap();
-    let bcd = DateTime::new(2019, 8, 1, 8, 31, 22);
-    let converted: NaiveDateTime = bcd.try_into().unwrap();
-    assert_eq!(converted, date_time);
-}
-
 impl Display for DateTime {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(f, "{} {}", self.date, self.time)
     }
-}
-
-#[test]
-fn test_date_time_bcd_display() {
-    let date_time = DateTime::new(2019, 8, 1, 8, 31, 22);
-    assert_eq!(date_time.to_string(), "2019-08-01 08:31:22");
 }
 
 #[derive(bincode::Decode, bincode::Encode, PartialEq, Eq, Debug, Default)]
@@ -320,22 +231,117 @@ impl TryInto<NaiveDate> for DateShortBCD {
     }
 }
 
-#[test]
-fn test_date_short_bcd_into_naive_date() {
-    let date = NaiveDate::from_ymd(2019, 1, 1);
-    let bcd = DateShortBCD::new(2019, 1, 1);
-    let converted: NaiveDate = bcd.try_into().unwrap();
-    assert_eq!(converted, date);
-}
-
 impl Display for DateShortBCD {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(f, "{:02x}{:02x}{:02x}", self.bcd.0, self.bcd.1, self.bcd.2)
     }
 }
 
-#[test]
-fn test_date_short_bcd_display() {
-    let date_time = DateShortBCD::new(2019, 8, 1);
-    assert_eq!(date_time.to_string(), "190801");
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_date_bcd_into_naive_date() {
+        let date = NaiveDate::from_ymd(2019, 1, 1);
+        let bcd = DateBCD::new(2019, 1, 1);
+        let converted: NaiveDate = bcd.try_into().unwrap();
+        assert_eq!(converted, date);
+    }
+
+    #[test]
+    fn test_date_bcd_from_naive_date() {
+        let date = NaiveDate::from_ymd(2019, 1, 1);
+        let bcd = DateBCD::new(2019, 1, 1);
+        let converted = DateBCD::try_from(date).unwrap();
+        assert_eq!(converted, bcd);
+    }
+
+    #[test]
+    fn test_time_without_seconds_bcd_into_naive_time() {
+        let time = NaiveTime::from_hms(8, 12, 0);
+        let bcd = TimeWithoutSecondsBCD::new(8, 12);
+        let converted: NaiveTime = bcd.try_into().unwrap();
+        assert_eq!(converted, time);
+    }
+
+    #[test]
+    fn test_date_bcd_display() {
+        let date = DateBCD::new(2019, 1, 1);
+        assert_eq!(date.to_string(), "2019-01-01");
+    }
+
+    #[test]
+    fn test_time_without_seconds_bcd_from_naive_time() {
+        let time = NaiveTime::from_hms(8, 12, 0);
+        let bcd = TimeWithoutSecondsBCD::new(8, 12);
+        let converted = TimeWithoutSecondsBCD::try_from(time).unwrap();
+        assert_eq!(converted, bcd);
+    }
+
+    #[test]
+    fn test_time_without_seconds_bcd_display() {
+        let time = TimeWithoutSecondsBCD::new(8, 12);
+        assert_eq!(time.to_string(), "08:12");
+    }
+
+    #[test]
+    fn test_time_with_seconds_bcd_into_naive_time() {
+        let time = NaiveTime::from_hms(8, 12, 13);
+        let bcd = TimeWithSecondsBCD::new(8, 12, 13);
+        let converted: NaiveTime = bcd.try_into().unwrap();
+        assert_eq!(converted, time);
+    }
+
+    #[test]
+    fn test_time_with_seconds_bcd_from_naive_time() {
+        let time = NaiveTime::from_hms(8, 12, 13);
+        let bcd = TimeWithSecondsBCD::new(8, 12, 13);
+        let converted = TimeWithSecondsBCD::try_from(time).unwrap();
+        assert_eq!(converted, bcd);
+    }
+
+    #[test]
+    fn test_time_with_seconds_bcd_display() {
+        let time = TimeWithSecondsBCD::new(8, 12, 13);
+        assert_eq!(time.to_string(), "08:12:13");
+    }
+
+    #[test]
+    fn test_date_time_bcd_from_naive_time() {
+        let date_time =
+            NaiveDateTime::parse_from_str("2019-08-01 08:31:22", "%Y-%m-%d %H:%M:%S").unwrap();
+        let bcd = DateTime::new(2019, 8, 1, 8, 31, 22);
+        let converted = DateTime::try_from(date_time).unwrap();
+        assert_eq!(converted, bcd);
+    }
+
+    #[test]
+    fn test_date_time_bcd_into_naive_date_time() {
+        let date_time =
+            NaiveDateTime::parse_from_str("2019-08-01 08:31:22", "%Y-%m-%d %H:%M:%S").unwrap();
+        let bcd = DateTime::new(2019, 8, 1, 8, 31, 22);
+        let converted: NaiveDateTime = bcd.try_into().unwrap();
+        assert_eq!(converted, date_time);
+    }
+
+    #[test]
+    fn test_date_time_bcd_display() {
+        let date_time = DateTime::new(2019, 8, 1, 8, 31, 22);
+        assert_eq!(date_time.to_string(), "2019-08-01 08:31:22");
+    }
+
+    #[test]
+    fn test_date_short_bcd_into_naive_date() {
+        let date = NaiveDate::from_ymd(2019, 1, 1);
+        let bcd = DateShortBCD::new(2019, 1, 1);
+        let converted: NaiveDate = bcd.try_into().unwrap();
+        assert_eq!(converted, date);
+    }
+
+    #[test]
+    fn test_date_short_bcd_display() {
+        let date_time = DateShortBCD::new(2019, 8, 1);
+        assert_eq!(date_time.to_string(), "190801");
+    }
 }
