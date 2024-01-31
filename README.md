@@ -4,4 +4,4 @@ uhppote-rs is a safe Rust library for access control systems based on the UHPPOT
 
 ## Usage
 
-For more info about how to use this library, see the [uhppote-rs](https://docs.rs/uhppote-rs/1/) crate on crate.io.
+For more info about how to use this library, see the [uhppote-rs](https://docs.rs/uhppote-rs/) crate on crate.io.
